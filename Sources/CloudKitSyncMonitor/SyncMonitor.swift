@@ -10,6 +10,7 @@ import CoreData
 import Network
 import SwiftUI
 import CloudKit
+import Combine
 
 /// A class that monitors and reports the current state of `NSPersistentCloudKitContainer` synchronization.
 ///
@@ -266,7 +267,10 @@ public class SyncMonitor: ObservableObject {
     
     /// Task for managing all monitoring activities
     private var monitoringTask: Task<Void, Error>?
-    
+
+    /// Where we store Combine cancellables for publishers we're listening to, e.g. NSPersistentCloudKitContainer's notifications.
+    private var disposables = Set<AnyCancellable>()
+
     // MARK: - Initializers -
     
     private init() {
@@ -336,6 +340,7 @@ public class SyncMonitor: ObservableObject {
         // Cancel the monitoring task started by the designated initializer
         self.monitoringTask?.cancel()
         self.monitoringTask = nil
+        disposables.forEach { $0.cancel() }
     }
     #endif
     
@@ -349,31 +354,25 @@ public class SyncMonitor: ObservableObject {
     // MARK: - Private methods -
     
     private func _startMonitoring() {
+        // Monitor NSPersistentCloudKitContainer sync events outside of async/await
+        NotificationCenter.default.publisher(for: NSPersistentCloudKitContainer.eventChangedNotification)
+            .receive(on: DispatchQueue.main)
+            .sink(receiveValue: { notification in
+                if let cloudEvent = notification.userInfo?[NSPersistentCloudKitContainer.eventNotificationUserInfoKey]
+                    as? NSPersistentCloudKitContainer.Event {
+                    let event = SyncEvent(from: cloudEvent) // To make testing possible
+                    self.processSyncEvent(event)
+                }
+            })
+            .store(in: &disposables)
+
         monitoringTask = Task {
             try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { try await self.listenToSyncEvents() }
                 group.addTask { try await self.monitorNetworkChanges() }
                 group.addTask { await self.monitorICloudAccountStatus() }
                 
                 try await group.waitForAll()
             }
-        }
-    }
-    
-    /// Listens to NSPersistentCloudKitContainer eventChangedNotification using async/await
-    private func listenToSyncEvents() async throws {
-        let notificationCenter = NotificationCenter.default
-        let syncEventStream = notificationCenter.notifications(named: NSPersistentCloudKitContainer.eventChangedNotification)
-            .compactMap { notification -> SyncEvent? in
-                guard let cloudKitEvent = notification.userInfo?[NSPersistentCloudKitContainer.eventNotificationUserInfoKey] as? NSPersistentCloudKitContainer.Event else {
-                    return nil
-                }
-                return SyncEvent(from: cloudKitEvent)
-            }
-        
-        for await event in syncEventStream {
-            try Task.checkCancellation()
-            processSyncEvent(event)
         }
     }
     
@@ -390,6 +389,7 @@ public class SyncMonitor: ObservableObject {
     }
     
     private func monitorICloudAccountStatus() async {
+        await updateICloudAccountStatus() // request account status immediately
         // See https://stackoverflow.com/a/77072667 for .map() usage
         let accountChangedStream = NotificationCenter.default.notifications(named: .CKAccountChanged).map { _ in () }
         for await _ in accountChangedStream {
